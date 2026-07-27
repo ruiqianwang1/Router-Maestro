@@ -62,8 +62,12 @@ COPILOT_COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 # model id (with no GHC catalog entry) to a real upstream Copilot model. Codex's
 # Auto-review (guardian) mode issues Responses requests with model
 # ``codex-auto-review``, which only exists on the ChatGPT/Codex subscription
-# backend; route it to GHC's low-latency ``gpt-5.4-mini`` subagent model.
-COPILOT_MODEL_ALIASES: dict[str, str] = {"codex-auto-review": "gpt-5.4-mini"}
+# backend; route it to a real GHC model instead.
+#
+# Local-only: upstream points this at ``gpt-5.4-mini``. Retargeted to
+# ``gpt-5.5`` because review quality matters more here than the mini model's
+# latency edge.
+COPILOT_MODEL_ALIASES: dict[str, str] = {"codex-auto-review": "gpt-5.5"}
 
 _COPILOT_UNSUPPORTED_OPERATION_CODE = "unsupported_api_for_model"
 _MAX_COPILOT_ERROR_BODY_BYTES = 64 * 1024

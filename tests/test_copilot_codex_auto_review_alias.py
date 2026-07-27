@@ -28,14 +28,16 @@ from router_maestro.routing.router import CACHE_TTL_SECONDS, Router
 from router_maestro.utils.cache import TTLCache
 
 ALIAS = "codex-auto-review"
-TARGET = "gpt-5.4-mini"
+# Local-only: upstream pins this to "gpt-5.4-mini". Kept in sync with the
+# retargeted COPILOT_MODEL_ALIASES entry in copilot.py.
+TARGET = "gpt-5.5"
 
 
 class AliasCopilotMock(BaseProvider):
     """Stand-in for the Copilot provider that declares the guardian alias.
 
     Mirrors the real ``CopilotProvider.model_aliases()`` contract without any
-    network/auth dependency, and exposes ``gpt-5.4-mini`` with ``/responses``
+    network/auth dependency, and exposes the alias target with ``/responses``
     support so a normalized alias has a real catalog target to resolve against.
     """
 
@@ -155,7 +157,7 @@ async def test_beta_responses_resolver_rewrites_model_to_target(monkeypatch) -> 
     Drives ``_resolve_responses_model`` — the exact resolver the beta passthrough
     route feeds into ``body["model"] = resolution.actual_model`` — with a real
     Router. A request whose ``model`` is ``codex-auto-review`` must yield
-    ``actual_model == "gpt-5.4-mini"``, i.e. the id sent upstream to GHC. This is
+    ``actual_model == TARGET``, i.e. the id sent upstream to GHC. This is
     the layer Codex's guardian request actually hits, not a helper below it.
     """
     from router_maestro.routing.capabilities import RequestFeatures

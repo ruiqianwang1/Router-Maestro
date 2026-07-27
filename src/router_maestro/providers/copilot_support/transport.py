@@ -23,6 +23,14 @@ from router_maestro.providers.copilot_support.auth_session import (
     AUTH_RETRY_STATUSES,
     CopilotAuthSession,
 )
+from router_maestro.providers.h2_keepalive import (
+    KEEPALIVE_INTERVAL,
+    H2KeepaliveTask,
+    StreamWatch,
+    is_mid_stream_disconnect,
+    log_truncated_stream,
+    raise_mid_stream_disconnect,
+)
 from router_maestro.utils import get_logger
 
 logger = get_logger("providers.copilot.transport")
@@ -35,6 +43,39 @@ def _request_audit():
     return context.audit if context is not None else None
 
 
+# SSE terminal markers. `[DONE]` closes an OpenAI-style chat stream; the
+# Responses API instead ends with a `response.completed`/`failed`/`incomplete`
+# event. A stream that stops without one of these was cut short.
+_TERMINAL_SSE_MARKERS = (
+    "data: [DONE]",
+    "event: response.completed",
+    "event: response.failed",
+    "event: response.incomplete",
+)
+
+
+def _instrument_stream(response: httpx.Response) -> StreamWatch:
+    """Wrap a response's line iterator so the transport can time the stream.
+
+    Chunk counts and idle durations are what distinguish an intermediary's
+    idle-reclaim from an upstream failure, but only the consumer knows when
+    bytes actually arrive. Wrapping `aiter_lines` -- the sole way this codebase
+    reads a stream body -- captures that without every caller opting in.
+    """
+    watch = StreamWatch()
+    original = response.aiter_lines
+
+    async def counting_aiter_lines() -> AsyncIterator[str]:
+        async for line in original():
+            watch.record_chunk()
+            if line.startswith(_TERMINAL_SSE_MARKERS):
+                watch.saw_terminal = True
+            yield line
+
+    response.aiter_lines = counting_aiter_lines
+    return watch
+
+
 class CopilotTransport:
     """Own pooled HTTP/2 clients, headers, retries, and stream lifetimes."""
 
@@ -44,6 +85,7 @@ class CopilotTransport:
         self.auth = auth
         self.client: httpx.AsyncClient | None = None
         self.client_created_at = 0.0
+        self.keepalive: H2KeepaliveTask | None = None
 
     def url(self, path: str) -> str:
         return f"{self.auth.api_base.rstrip('/')}/{path.lstrip('/')}"
@@ -123,6 +165,7 @@ class CopilotTransport:
             and now - self.client_created_at >= self.client_max_age
         )
         if needs_recycle:
+            self._stop_keepalive()
             asyncio.ensure_future(self.client.aclose())
             self.client = None
         if self.client is None or self.client.is_closed:
@@ -136,15 +179,35 @@ class CopilotTransport:
                 ),
             )
             self.client_created_at = now
+            self._start_keepalive(self.client)
         return self.client
 
+    def _start_keepalive(self, client: httpx.AsyncClient) -> None:
+        self.keepalive = H2KeepaliveTask(client, interval=KEEPALIVE_INTERVAL)
+        self.keepalive.start()
+
+    def _stop_keepalive(self) -> None:
+        """Cancel the keepalive task without awaiting (sync callers)."""
+        keepalive = self.keepalive
+        self.keepalive = None
+        if keepalive is not None and keepalive.running:
+            asyncio.ensure_future(keepalive.stop())
+
     async def recycle_client(self) -> None:
+        keepalive = self.keepalive
+        self.keepalive = None
+        if keepalive is not None:
+            await keepalive.stop()
         if self.client and not self.client.is_closed:
             with contextlib.suppress(Exception):
                 await self.client.aclose()
         self.client = None
 
     async def close(self) -> None:
+        keepalive = self.keepalive
+        self.keepalive = None
+        if keepalive is not None:
+            await keepalive.stop()
         if self.client and not self.client.is_closed:
             await self.client.aclose()
         self.client = None
@@ -292,8 +355,33 @@ class CopilotTransport:
                     await response.aread()
                 await cm.__aexit__(None, None, None)
                 raise_auth_failure(path, response.status_code, model=model)
+            watch = _instrument_stream(response)
             try:
                 yield response
+            except httpx.HTTPError as error:
+                # A transport error surfacing here was raised while the caller
+                # was consuming an *already open* stream, so the response was
+                # amputated. Report it distinctly from a connect-time failure:
+                # folding the two together is what made silent tunnel
+                # disconnects invisible in the logs.
+                #
+                # This lives in the transport rather than in each caller so
+                # every stream path is covered by construction.
+                if is_mid_stream_disconnect(error):
+                    raise_mid_stream_disconnect(
+                        f"Copilot {path}",
+                        error,
+                        provider=self.auth.provider_name,
+                        model=model,
+                        watch=watch,
+                    )
+                raise
+            else:
+                # Chunks arrived but the caller never saw a terminal event: an
+                # orderly transport shutdown can still deliver a truncated
+                # response.
+                if watch.chunks and not watch.saw_terminal:
+                    log_truncated_stream(f"Copilot {path}", model=model, watch=watch)
             finally:
                 await cm.__aexit__(None, None, None)
             return
